@@ -537,8 +537,9 @@ void EnzoMethodMultipole::dual_walk_(EnzoBlock * enzo_block) throw()
             }
             else {
               // start the dual tree walk on all pairs of root blocks, including self-interactions
-              int type = enzo_block->is_leaf() ? 1 : 0;
-              enzo::block_array()[index].p_method_multipole_traverse(other_ind, type);
+              // whether the other root block is a leaf is not known here
+              // (-1): traverse() asks it
+              enzo::block_array()[index].p_method_multipole_traverse(other_ind, -1);
             }
           }
         }
