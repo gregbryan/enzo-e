@@ -2098,6 +2098,10 @@ void EnzoMethodMultipole::pack_dens_(EnzoBlock * enzo_block, Index index_b) thro
   char * prtbuffer_next = particle.save_data(prtbuffer);
 
   enzo::block_array()[index_b].p_method_multipole_interact_direct (fldsize, prtsize, fldbuffer, prtbuffer);
+
+  // the entry method call copies the arrays into its message
+  delete [] fldbuffer;
+  delete [] prtbuffer;
 }
 
 
