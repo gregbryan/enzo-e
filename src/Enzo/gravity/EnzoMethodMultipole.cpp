@@ -488,6 +488,11 @@ void EnzoMethodMultipole::begin_up_cycle_(EnzoBlock * enzo_block) throw()
   }
 
 
+  // The volume is initialized before the barrier: after it, other Blocks may
+  // already be sending update_volume() to this one, before this Block has
+  // itself received the barrier's broadcast.
+  *volume_(enzo_block) = block_volume_[level];
+
   CkCallback callback(CkIndex_EnzoBlock::r_method_multipole_dualwalk_barrier(nullptr),
 		      enzo::block_array());
   enzo::block(enzo_block)->contribute(callback);
@@ -509,8 +514,6 @@ void EnzoMethodMultipole::dual_walk_(EnzoBlock * enzo_block) throw()
 
   const Index& index = enzo_block->index();
   int level = enzo_block->level();
-
-  *volume_(enzo_block) = block_volume_[level];
 
   // if level == min_level_
   if (level == 0) {
