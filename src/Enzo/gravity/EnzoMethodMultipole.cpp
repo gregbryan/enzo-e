@@ -1970,9 +1970,13 @@ void EnzoMethodMultipole::interact_approx_(Block * block, MultipoleMsg * msg_b) 
     //CkPrintf("d1_ewald in interact_approx: %f, %f, %f\n", d1_ewald[0], d1_ewald[1], d1_ewald[2]);
     
     // Combine the derivative tensors from the periodic and non-periodic contributions    
-    d1 = add_11_(d1, d1_ewald);
-    d2 = add_22_(d2, d2_ewald);
-    d3 = add_33_(d3, d3_ewald);
+    // The tables hold the derivatives of n(W) = 1/|W| - V_per(W), so those
+    // of the periodic Green's function V_per are the Newtonian ones minus
+    // the tabulated ones (the direct sums add +grad n to the acceleration
+    // for the same reason).
+    d1 = add_11_(d1, dot_scalar_1_(-1.0, d1_ewald));
+    d2 = add_22_(d2, dot_scalar_2_(-1.0, d2_ewald));
+    d3 = add_33_(d3, dot_scalar_3_(-1.0, d3_ewald));
   }
   
   // compute the coefficients of the Taylor expansion of acceleration due to the particles in Block b
