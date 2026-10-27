@@ -608,6 +608,8 @@ void EnzoMethodMultipole::begin_down_cycle_(EnzoBlock * enzo_block) throw()
 
   else {
     prolong_send (enzo_block);
+    // non-leaf Blocks take no further part in this Method
+    enzo_block->compute_done();
   }
   
 }
