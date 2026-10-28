@@ -45,6 +45,7 @@ public: // interface -- which methods should be public and which protected?
       interp_xpoints_(64),
       interp_ypoints_(64),
       interp_zpoints_(64),
+      ewald_(nullptr),
       dt_max_(1.0e10),
       ir_exit_(-1)
   { for (int i = 0; i < cello::num_children(); i++) i_msg_restrict_[i] = -1; }
