@@ -1761,6 +1761,11 @@ void EnzoMethodMultipole::traverse
   if (index_a == index_b) {
     // CkPrintf("root double loop\n");
 
+    // A leaf has no children to pair up. Messages sent to the (not yet
+    // existing) children of a leaf are held by Charm++ until they are
+    // created by a later refinement, and then delivered to them.
+    if (is_leaf_a) return;
+
     // loop 1 through A children
     while (it_child_a.next(ica3)) {
       int ica = ica3[0] + 2*(ica3[1] + 2*ica3[2]);
