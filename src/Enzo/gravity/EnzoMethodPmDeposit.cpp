@@ -536,10 +536,12 @@ void EnzoMethodPmDeposit::compute ( Block * block) throw()
 
    if (enzo::simulation()->cycle() == enzo::config()->initial_cycle) {
     // Check if the gravity method is being used and that pm_deposit
-    // precedes the gravity method.
+    // precedes the gravity method (or the multipole method, which can
+    // be used in its place).
     ASSERT("EnzoMethodPmDeposit",
            "Error: pm_deposit method must precede gravity method.",
-           enzo::problem()->method_precedes("pm_deposit", "gravity"));
+           enzo::problem()->method_precedes("pm_deposit", "gravity") ||
+           enzo::problem()->method_precedes("pm_deposit", "multipole"));
   }
 
   if (block->is_leaf()) {
