@@ -21,9 +21,10 @@ EnzoMethodMultipole::EnzoMethodMultipole (ParameterGroup p)
     is_volume_(-1),
     block_volume_(),
     max_volume_(0),
-    interp_xpoints_(p.value_integer("interp_xpoints", 64)),
-    interp_ypoints_(p.value_integer("interp_ypoints", 64)),
-    interp_zpoints_(p.value_integer("interp_zpoints", 64)),
+    interp_xpoints_(p.value_integer("interp_xpoints", 32)),
+    interp_ypoints_(p.value_integer("interp_ypoints", 32)),
+    interp_zpoints_(p.value_integer("interp_zpoints", 32)),
+    ewald_order_(p.value_integer("ewald_order", 3)),
     dt_max_(p.value_float("dt_max", 1.0e10)),
     ir_exit_(-1)
 {
@@ -80,6 +81,10 @@ EnzoMethodMultipole::EnzoMethodMultipole (ParameterGroup p)
 
   ewald_ = nullptr;
 
+  ASSERT1("EnzoMethodMultipole",
+          "Method:multipole:ewald_order must be 3 or 4 (it is %d)",
+          ewald_order_, (ewald_order_ == 3 || ewald_order_ == 4));
+
 }
 
 //----------------------------------------------------------------------
@@ -114,6 +119,7 @@ void EnzoMethodMultipole::pup (PUP::er &p)
   p | interp_xpoints_;
   p | interp_ypoints_;
   p | interp_zpoints_;
+  p | ewald_order_;
   p | dt_max_;
 
   // bool ewald_is_nullptr = (ewald_ == nullptr);
@@ -313,7 +319,8 @@ void EnzoMethodMultipole::compute ( Block * block) throw()
     // dimensions of the downsampled interpolation grid as input parameters.
     // Then copy (or move if the compiler is smart) the result into this->ewald_
 
-    ewald_ = new EnzoEwald (interp_xpoints_, interp_ypoints_, interp_zpoints_);
+    ewald_ = new EnzoEwald (interp_xpoints_, interp_ypoints_, interp_zpoints_,
+                            ewald_order_);
 
   } 
   

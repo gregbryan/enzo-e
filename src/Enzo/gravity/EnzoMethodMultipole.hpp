@@ -42,9 +42,10 @@ public: // interface -- which methods should be public and which protected?
       is_volume_(-1),
       block_volume_(),
       max_volume_(0),
-      interp_xpoints_(64),
-      interp_ypoints_(64),
-      interp_zpoints_(64),
+      interp_xpoints_(32),
+      interp_ypoints_(32),
+      interp_zpoints_(32),
+      ewald_order_(3),
       ewald_(nullptr),
       dt_max_(1.0e10),
       ir_exit_(-1)
@@ -699,6 +700,10 @@ protected: // attributes
   int interp_xpoints_;
   int interp_ypoints_;
   int interp_zpoints_;
+
+  /// order (3 or 4) of the Taylor expansion about the nearest grid point
+  /// used to interpolate the first derivative of the Ewald correction
+  int ewald_order_;
 
   /// object for storing interpolation grid needed for Ewald summation (periodic BCs)
   EnzoEwald * ewald_;

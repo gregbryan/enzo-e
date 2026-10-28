@@ -12,10 +12,11 @@
 // #include "view.hpp"
 
 
-EnzoEwald::EnzoEwald (int interp_xpoints, int interp_ypoints, int interp_zpoints)
+EnzoEwald::EnzoEwald (int interp_xpoints, int interp_ypoints, int interp_zpoints, int order)
   : interp_xpoints_(interp_xpoints),  // number of interpolation points in the x-direction
     interp_ypoints_(interp_ypoints),  // number of interpolation points in the y-direction
-    interp_zpoints_(interp_zpoints)  // number of interpolation points in the z-direction
+    interp_zpoints_(interp_zpoints),  // number of interpolation points in the z-direction
+    order_(order)                     // order of the Taylor expansion in interp_d1()
     
 { 
   // EnzoEwald constructor is called in *compute* of EnzoMethodMultipole
@@ -858,7 +859,6 @@ std::array<double, 3> EnzoEwald::interp_d1(double x, double y, double z) throw()
   std::array<double, 3> delta_r = {x - interp_x, y - interp_y, z - interp_z};
   std::array<double, 6> delta_r2 = EnzoMethodMultipole::outer_11_(delta_r, delta_r);
   std::array<double, 10> delta_r3 = EnzoMethodMultipole::outer_12_(delta_r, delta_r2);
-  std::array<double, 15> delta_r4 = EnzoMethodMultipole::outer_13_(delta_r, delta_r3);
 
   // std::array<double, 3> zeroth_term = d1_array_[i]; // d1_array_.subarray(i) 
   // std::array<double, 3> first_term = EnzoMethodMultipole::dot_12_(delta_r, d2_array_[i]);
@@ -871,7 +871,7 @@ std::array<double, 3> EnzoEwald::interp_d1(double x, double y, double z) throw()
   std::array<double, 3> first_term;
   std::array<double, 3> second_term;
   std::array<double, 3> third_term;
-  std::array<double, 3> fourth_term;
+  std::array<double, 3> fourth_term = {0.0, 0.0, 0.0};  // only needed if order_ >= 4
 
   first_term[0] = delta_r[0]*d2_array_(i,0) + delta_r[1]*d2_array_(i,1) + delta_r[2]*d2_array_(i,2);   
   first_term[1] = delta_r[0]*d2_array_(i,1) + delta_r[1]*d2_array_(i,3) + delta_r[2]*d2_array_(i,4);   
@@ -885,9 +885,14 @@ std::array<double, 3> EnzoEwald::interp_d1(double x, double y, double z) throw()
   third_term[1] = delta_r3[0]*d4_array_(i,1) + 3*delta_r3[1]*d4_array_(i,3) + 3*delta_r3[2]*d4_array_(i,4) + 3*delta_r3[3]*d4_array_(i,6) + 6*delta_r3[4]*d4_array_(i,7) + 3*delta_r3[5]*d4_array_(i,8) + delta_r3[6]*d4_array_(i,10) + 3*delta_r3[7]*d4_array_(i,11) + 3*delta_r3[8]*d4_array_(i,12) + delta_r3[9]*d4_array_(i,13);
   third_term[2] = delta_r3[0]*d4_array_(i,2) + 3*delta_r3[1]*d4_array_(i,4) + 3*delta_r3[2]*d4_array_(i,5) + 3*delta_r3[3]*d4_array_(i,7) + 6*delta_r3[4]*d4_array_(i,8) + 3*delta_r3[5]*d4_array_(i,9) + delta_r3[6]*d4_array_(i,11) + 3*delta_r3[7]*d4_array_(i,12) + 3*delta_r3[8]*d4_array_(i,13) + delta_r3[9]*d4_array_(i,14);
 
-  fourth_term[0] = delta_r4[0]*d5_array_(i,0) + 4*delta_r4[1]*d5_array_(i,1) + 4*delta_r4[2]*d5_array_(i,2) + 6*delta_r4[3]*d5_array_(i,3) + 12*delta_r4[4]*d5_array_(i,4) + 6*delta_r4[5]*d5_array_(i,5) + 4*delta_r4[6]*d5_array_(i,6) + 12*delta_r4[7]*d5_array_(i,7) + 12*delta_r4[8]*d5_array_(i,8) + 4*delta_r4[9]*d5_array_(i,9) + delta_r4[10]*d5_array_(i,10) + 4*delta_r4[11]*d5_array_(i,11) + 6*delta_r4[12]*d5_array_(i,12) + 4*delta_r4[13]*d5_array_(i,13) + delta_r4[14]*d5_array_(i,14);
-  fourth_term[1] = delta_r4[0]*d5_array_(i,1) + 4*delta_r4[1]*d5_array_(i,3) + 4*delta_r4[2]*d5_array_(i,4) + 6*delta_r4[3]*d5_array_(i,6) + 12*delta_r4[4]*d5_array_(i,7) + 6*delta_r4[5]*d5_array_(i,8) + 4*delta_r4[6]*d5_array_(i,10) + 12*delta_r4[7]*d5_array_(i,11) + 12*delta_r4[8]*d5_array_(i,12) + 4*delta_r4[9]*d5_array_(i,13) + delta_r4[10]*d5_array_(i,15) + 4*delta_r4[11]*d5_array_(i,16) + 6*delta_r4[12]*d5_array_(i,17) + 4*delta_r4[13]*d5_array_(i,18) + delta_r4[14]*d5_array_(i,19);
-  fourth_term[2] = delta_r4[0]*d5_array_(i,2) + 4*delta_r4[1]*d5_array_(i,4) + 4*delta_r4[2]*d5_array_(i,5) + 6*delta_r4[3]*d5_array_(i,7) + 12*delta_r4[4]*d5_array_(i,8) + 6*delta_r4[5]*d5_array_(i,9) + 4*delta_r4[6]*d5_array_(i,11) + 12*delta_r4[7]*d5_array_(i,12) + 12*delta_r4[8]*d5_array_(i,13) + 4*delta_r4[9]*d5_array_(i,14) + delta_r4[10]*d5_array_(i,16) + 4*delta_r4[11]*d5_array_(i,17) + 6*delta_r4[12]*d5_array_(i,18) + 4*delta_r4[13]*d5_array_(i,19) + delta_r4[14]*d5_array_(i,20);
+  // the fourth-order term needs the 5th derivatives of the potential
+  if (order_ >= 4) {
+    std::array<double, 15> delta_r4 = EnzoMethodMultipole::outer_13_(delta_r, delta_r3);
+
+    fourth_term[0] = delta_r4[0]*d5_array_(i,0) + 4*delta_r4[1]*d5_array_(i,1) + 4*delta_r4[2]*d5_array_(i,2) + 6*delta_r4[3]*d5_array_(i,3) + 12*delta_r4[4]*d5_array_(i,4) + 6*delta_r4[5]*d5_array_(i,5) + 4*delta_r4[6]*d5_array_(i,6) + 12*delta_r4[7]*d5_array_(i,7) + 12*delta_r4[8]*d5_array_(i,8) + 4*delta_r4[9]*d5_array_(i,9) + delta_r4[10]*d5_array_(i,10) + 4*delta_r4[11]*d5_array_(i,11) + 6*delta_r4[12]*d5_array_(i,12) + 4*delta_r4[13]*d5_array_(i,13) + delta_r4[14]*d5_array_(i,14);
+    fourth_term[1] = delta_r4[0]*d5_array_(i,1) + 4*delta_r4[1]*d5_array_(i,3) + 4*delta_r4[2]*d5_array_(i,4) + 6*delta_r4[3]*d5_array_(i,6) + 12*delta_r4[4]*d5_array_(i,7) + 6*delta_r4[5]*d5_array_(i,8) + 4*delta_r4[6]*d5_array_(i,10) + 12*delta_r4[7]*d5_array_(i,11) + 12*delta_r4[8]*d5_array_(i,12) + 4*delta_r4[9]*d5_array_(i,13) + delta_r4[10]*d5_array_(i,15) + 4*delta_r4[11]*d5_array_(i,16) + 6*delta_r4[12]*d5_array_(i,17) + 4*delta_r4[13]*d5_array_(i,18) + delta_r4[14]*d5_array_(i,19);
+    fourth_term[2] = delta_r4[0]*d5_array_(i,2) + 4*delta_r4[1]*d5_array_(i,4) + 4*delta_r4[2]*d5_array_(i,5) + 6*delta_r4[3]*d5_array_(i,7) + 12*delta_r4[4]*d5_array_(i,8) + 6*delta_r4[5]*d5_array_(i,9) + 4*delta_r4[6]*d5_array_(i,11) + 12*delta_r4[7]*d5_array_(i,12) + 12*delta_r4[8]*d5_array_(i,13) + 4*delta_r4[9]*d5_array_(i,14) + delta_r4[10]*d5_array_(i,16) + 4*delta_r4[11]*d5_array_(i,17) + 6*delta_r4[12]*d5_array_(i,18) + 4*delta_r4[13]*d5_array_(i,19) + delta_r4[14]*d5_array_(i,20);
+  }
 
   // CkPrintf("d1 ewald zeroth_term: %f, %f, %f\n", d1_array_(i, 0), d1_array_(i, 1), d1_array_(i, 2));
   // CkPrintf("d1 ewald first_term: %f, %f, %f\n", first_term[0], first_term[1], first_term[2]);
@@ -896,9 +901,9 @@ std::array<double, 3> EnzoEwald::interp_d1(double x, double y, double z) throw()
 
 
   std::array<double, 3> sum; 
-  sum[0] = d1_array_(i, 0) + first_term[0] + 0.5*second_term[0] + 1.0/6.0*third_term[0]; //+ 1.0/24*fourth_term[0];
-  sum[1] = d1_array_(i, 1) + first_term[1] + 0.5*second_term[1] + 1.0/6.0*third_term[1]; //+ 1.0/24*fourth_term[1];
-  sum[2] = d1_array_(i, 2) + first_term[2] + 0.5*second_term[2] + 1.0/6.0*third_term[2]; //+ 1.0/24*fourth_term[2];
+  sum[0] = d1_array_(i, 0) + first_term[0] + 0.5*second_term[0] + 1.0/6.0*third_term[0] + 1.0/24.0*fourth_term[0];
+  sum[1] = d1_array_(i, 1) + first_term[1] + 0.5*second_term[1] + 1.0/6.0*third_term[1] + 1.0/24.0*fourth_term[1];
+  sum[2] = d1_array_(i, 2) + first_term[2] + 0.5*second_term[2] + 1.0/6.0*third_term[2] + 1.0/24.0*fourth_term[2];
 
   return sum;
   

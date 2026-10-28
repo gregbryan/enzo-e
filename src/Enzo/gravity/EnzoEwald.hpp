@@ -20,19 +20,24 @@ class EnzoEwald {
 
 public: 
 
-  /// Create a new EnzoEwald object
-  EnzoEwald (int interp_xpoints, int interp_ypoints, int interp_zpoints);
+  /// Create a new EnzoEwald object. "order" is the order of the Taylor
+  /// expansion about the nearest grid point used by interp_d1(): 3 or 4
+  /// (the fourth-order term needs the 5th derivatives, which are tabulated)
+  EnzoEwald (int interp_xpoints, int interp_ypoints, int interp_zpoints,
+             int order = 3);
 
   EnzoEwald()
-    : interp_xpoints_(64),  // number of interpolation points in the x-direction
-      interp_ypoints_(64),  // number of interpolation points in the y-direction
-      interp_zpoints_(64)   // number of interpolation points in the z-direction
+    : interp_xpoints_(32),  // number of interpolation points in the x-direction
+      interp_ypoints_(32),  // number of interpolation points in the y-direction
+      interp_zpoints_(32),  // number of interpolation points in the z-direction
+      order_(3)             // order of the Taylor expansion in interp_d1()
   { }
 
   void pup(PUP::er &p) {
     p | interp_xpoints_;
     p | interp_ypoints_;
     p | interp_zpoints_;
+    p | order_;
   }
 
   void init_interpolate_() throw();
@@ -95,6 +100,9 @@ protected: //attributes
   int interp_xpoints_;
   int interp_ypoints_;
   int interp_zpoints_;
+
+  // order of the Taylor expansion about the nearest grid point in interp_d1()
+  int order_;
 
   // int tot_points_ = interp_xpoints_ * interp_ypoints_ * interp_zpoints_;
   //const int tot_points_ = 10
