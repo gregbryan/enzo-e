@@ -564,7 +564,7 @@ void EnzoMethodMultipole::dual_walk_(EnzoBlock * enzo_block) throw()
   }
 
   if (! enzo_block->is_leaf()) {
-    
+
     // traverse terminates when all leaf blocks done. Since we use a
     // barrier on all blocks, we call the barrier now on all non-leaf
     // blocks
@@ -1851,26 +1851,35 @@ void EnzoMethodMultipole::traverse_approx_pair
  Index index_b, int volume_b)
 {
 
+  // update volumes for each block to detect when to terminate traverse.
+  // The volume of each Block is carried by the interaction message to the
+  // other one, which credits it after applying the interaction (see
+  // p_method_multipole_interact_approx()), so that a Block cannot be counted as
+  // complete before the interaction has been applied. (Messages between
+  // two Blocks are not guaranteed to arrive in the order they were sent.)
+
   // compute the a->b interaction
   MultipoleMsg * msg_a = pack_multipole_(enzo_block);
+  // (note blocks may be equal, so don't double-count)
+  msg_a->volume = (index_a != index_b) ? volume_a : 0;
   enzo::block_array()[index_b].p_method_multipole_interact_approx(msg_a);
 
   // compute the b->a interaction; can we exploit symmetry here?
   enzo::block_array()[index_b].p_method_multipole_interact_approx_send (index_a);
 
-  // update volumes for each block to detect when to terminate traverse
-  update_volume (enzo_block,index_b,volume_b);
-
-  // do we need to check if blocks are equal?
-  if (index_a != index_b) {
-    enzo::block_array()[index_b].p_method_multipole_update_volume (index_a,volume_a);
+  if (index_a == index_b) {
+    update_volume (enzo_block,index_b,volume_b);
   }
 }
 
 void EnzoBlock::p_method_multipole_interact_approx (MultipoleMsg * msg)
 {
   EnzoMethodMultipole * method = static_cast<EnzoMethodMultipole*> (this->method());
+  const int volume = msg->volume;
   method->interact_approx_ (this, msg);
+  if (volume != 0) {
+    method->update_volume (this, this->index(), volume);
+  }
 }
 
 void EnzoBlock::p_method_multipole_interact_approx_send (Index receiver)
@@ -1882,6 +1891,8 @@ void EnzoBlock::p_method_multipole_interact_approx_send (Index receiver)
 void EnzoMethodMultipole::interact_approx_send(EnzoBlock * enzo_block, Index receiver) throw()
 {
   MultipoleMsg * msg = pack_multipole_(enzo_block);
+  // credited by the receiver after it has applied the multipole
+  msg->volume = block_volume_[enzo_block->level()];
   enzo::block_array()[receiver].p_method_multipole_interact_approx(msg);
 }
 
@@ -2016,36 +2027,47 @@ void EnzoMethodMultipole::traverse_direct_pair
  Index index_a, int volume_a,
  Index index_b, int volume_b)
 {
+  // update volumes for each block to detect when to terminate traverse.
+  // The volume is carried by the interaction message and credited by the
+  // receiver after applying it (see traverse_approx_pair()).
+
   // compute the a->b interaction
-  pack_dens_(enzo_block, index_b);
+  // (note blocks may be equal, so don't double-count)
+  pack_dens_(enzo_block, index_b, (index_a != index_b) ? volume_a : 0);
 
   // compute the b->a interaction; any way to exploit symmetry here?
   enzo::block_array()[index_b].p_method_multipole_interact_direct_send (index_a);
 
-  // update volumes for each block to detect when to terminate traverse
-  update_volume (enzo_block,index_b,volume_b);
-  if (index_a != index_b) {
-    // (note blocks may be equal, so don't double-count)
-    enzo::block_array()[index_b].p_method_multipole_update_volume (index_a,volume_a);
+  if (index_a == index_b) {
+    update_volume (enzo_block,index_b,volume_b);
   }
 
 }
 
-void EnzoBlock::p_method_multipole_interact_direct (int fldsize, int prtsize, char * fldbuffer, char * prtbuffer)
+void EnzoBlock::p_method_multipole_interact_direct (int volume, int fldsize, int prtsize, char * fldbuffer, char * prtbuffer)
 {
   EnzoMethodMultipole * method = static_cast<EnzoMethodMultipole*> (this->method());
   method->interact_direct_ (this, fldbuffer, prtbuffer);
+  if (volume != 0) {
+    method->update_volume (this, this->index(), volume);
+  }
 }
 
 void EnzoBlock::p_method_multipole_interact_direct_send (Index receiver)
 {
   EnzoMethodMultipole * method = static_cast<EnzoMethodMultipole*> (this->method());
-  method->pack_dens_ (this, receiver);
+  method->interact_direct_send (this, receiver);
+}
+
+void EnzoMethodMultipole::interact_direct_send(EnzoBlock * enzo_block, Index receiver) throw()
+{
+  // the receiver credits this volume after applying the data
+  pack_dens_ (enzo_block, receiver, block_volume_[enzo_block->level()]);
 }
 
 
 
-void EnzoMethodMultipole::pack_dens_(EnzoBlock * enzo_block, Index index_b) throw()
+void EnzoMethodMultipole::pack_dens_(EnzoBlock * enzo_block, Index index_b, int volume) throw()
 {
 
   Data * data = enzo_block->data();
@@ -2112,7 +2134,7 @@ void EnzoMethodMultipole::pack_dens_(EnzoBlock * enzo_block, Index index_b) thro
   char * prtbuffer = new char[prtsize];
   char * prtbuffer_next = particle.save_data(prtbuffer);
 
-  enzo::block_array()[index_b].p_method_multipole_interact_direct (fldsize, prtsize, fldbuffer, prtbuffer);
+  enzo::block_array()[index_b].p_method_multipole_interact_direct (volume, fldsize, prtsize, fldbuffer, prtbuffer);
 
   // the entry method call copies the arrays into its message
   delete [] fldbuffer;

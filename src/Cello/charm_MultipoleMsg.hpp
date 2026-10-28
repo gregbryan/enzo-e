@@ -63,6 +63,10 @@ public: // attributes
   /// Child indices
   int ic3[3];
 
+  /// Volume to be credited to the receiver once the message was applied
+  /// (interact_approx only)
+  int volume;
+
 
   /// lower left corner of Block
   // double lo[3];

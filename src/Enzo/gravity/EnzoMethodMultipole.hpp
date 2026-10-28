@@ -268,6 +268,8 @@ public:
 
   void interact_approx_send(EnzoBlock * enzo_block, Index receiver) throw();
 
+  void interact_direct_send(EnzoBlock * enzo_block, Index receiver) throw();
+
   void dual_walk_ (EnzoBlock * enzo_block) throw();
 
   void traverse (EnzoBlock * enzo_block, Index index_b, int type_b);
@@ -283,7 +285,7 @@ public:
                             Index index_a, int volume_a,
                             Index index_b, int volume_b);
 
-  void pack_dens_ (EnzoBlock * enzo_block, Index index_b) throw(); 
+  void pack_dens_ (EnzoBlock * enzo_block, Index index_b, int volume) throw();
 
   void update_volume (EnzoBlock * enzo_block, Index index, int volume);
 

@@ -196,7 +196,7 @@ module enzo {
     entry void p_method_multipole_traverse(Index index, int type);
     entry void p_method_multipole_interact_approx (MultipoleMsg * msg);
     entry void p_method_multipole_interact_approx_send (Index receiver);
-    entry void p_method_multipole_interact_direct (int fldsize, int prtsize, char fldbuffer[fldsize], char prtbuffer[prtsize]);
+    entry void p_method_multipole_interact_direct (int volume, int fldsize, int prtsize, char fldbuffer[fldsize], char prtbuffer[prtsize]);
     entry void p_method_multipole_interact_direct_send (Index receiver);
     entry void p_method_multipole_update_volume (Index index, int volume);
     entry void r_method_multipole_dualwalk_barrier(CkReductionMsg* msg);
