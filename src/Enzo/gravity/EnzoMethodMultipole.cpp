@@ -579,6 +579,19 @@ void EnzoMethodMultipole::dual_walk_(EnzoBlock * enzo_block) throw()
 			enzo::block_array());
     enzo::block(enzo_block)->contribute(callback);
   }
+  else {
+
+    int nx, ny, nz;
+    cello::hierarchy()->root_blocks(&nx, &ny, &nz);
+
+    // A leaf is complete only after this callback has run (other Blocks
+    // may have credited it all of its volume before): credit the extra
+    // unit of volume that update_volume() waits for. (A lone root Block
+    // that is a leaf does not wait for update_volume().)
+    if (level > 0 || nx*ny*nz != 1) {
+      update_volume (enzo_block, index, 1);
+    }
+  }
 }
 
 void EnzoBlock::r_method_multipole_traverse_complete(CkReductionMsg * msg)
@@ -2645,7 +2658,8 @@ void EnzoMethodMultipole::update_volume
 
     *volume_(enzo_block) += volume;
 
-    if (*volume_(enzo_block) == max_volume_) {
+    // max_volume_ plus the unit credited by this Block's own dual_walk_()
+    if (*volume_(enzo_block) == max_volume_ + 1) {
 
       CkCallback callback(CkIndex_EnzoBlock::r_method_multipole_traverse_complete(nullptr),
 			        enzo::block_array());
