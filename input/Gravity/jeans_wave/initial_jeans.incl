@@ -98,10 +98,7 @@
       # The final time is:
       #     lambda / (cs_0 * sqrt(1 - (lambda / lambda_J)^2))
       # in this setup: c_s = 1, lambda = 1, lambda_J = 2
-      
-      # time = 1.1547005383792517; # = 1.0 / sqrt(0.75)
-
-      cycle = 4;
+      time = 1.1547005383792517; # = 1.0 / sqrt(0.75)
    }
 
    Group {
@@ -116,16 +113,12 @@
       data {
          type = "data";
 	 field_list = ["density", "velocity_x", "velocity_y", "velocity_z",
-                       "total_energy", "pressure",
-		      "acceleration_x", "acceleration_y", "acceleration_z"];
+                       "total_energy", "pressure"];
          name = ["data-%03d.h5", "proc"];
          #dir = ["method_ppm-cg-1-jeansN16_%.4f","time"];
          schedule {
-             # var = "time";
-             # list = [0.0, 1.1547005383792517];
-
-	     var = "cycle";
-	     list = [0, 1, 2];
+             var = "time";
+             list = [0.0, 1.1547005383792517];
          }
       }
    }

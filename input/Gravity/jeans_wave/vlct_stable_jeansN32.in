@@ -7,5 +7,5 @@
    }
 
    Output {
-      data { dir = ["method_vlct-cg-1-inclined-jeansN32_nonperiodic_%.4f","time"]; }
+      data { dir = ["method_vlct-cg-1-inclined-jeansN32_%.4f","time"]; }
    }
