@@ -10,6 +10,8 @@
 #include "Enzo/enzo.hpp"
 #include "Enzo/gravity/gravity.hpp"
 #include "Enzo/gravity/EnzoEwald.hpp"
+#include "Enzo/gravity/EnzoMethodMultipoleDirect.hpp"
+#include <map>
 
 //----------------------------------------------------------------------
 
@@ -136,7 +138,6 @@ void EnzoMethodMultipole::pup (PUP::er &p)
 
 void EnzoMethodMultipole::compute ( Block * block) throw()
 {
-
   // CkPrintf("have we made it to compute?\n");
   
   Sync * sync_restrict = psync_restrict(block);
@@ -1170,6 +1171,213 @@ void EnzoMethodMultipole::compute_multipoles_ (Block * block) throw()
   }
 }
  
+//----------------------------------------------------------------------
+// Helpers for the direct sums in interact_direct_ and evaluate_force_
+
+namespace {
+
+/// Adapter giving the kernels access to the Ewald correction
+struct EwaldD1 {
+  static constexpr bool enabled = true;
+  EnzoEwald * ewald;
+  explicit EwaldD1 (EnzoEwald * e) : ewald(e) {}
+  std::array<double,3> operator() (double x, double y, double z) const
+  { return ewald->interp_d1(x,y,z); }
+  std::array<double,6> d2 (double x, double y, double z) const
+  { return ewald->interp_d2(x,y,z); }
+  std::array<double,10> d3 (double x, double y, double z) const
+  { return ewald->interp_d3(x,y,z); }
+  const void * id () const { return ewald; }
+};
+
+/// A batch of this Block's particles (targets of the direct sums)
+struct TargetBatch {
+  int np; size_t offset;
+  enzo_float * ax; enzo_float * ay; enzo_float * az;
+  int dax, day, daz;
+};
+
+/// Parameters of the direct sums for the current simulation state
+fmm_direct::Params direct_params (double eps0, double grav_const)
+{
+  fmm_direct::Params params;
+  params.eps0 = eps0;
+  params.grav_const = grav_const;
+  params.rank = cello::rank();
+  int px, py, pz;
+  cello::hierarchy()->get_periodicity(&px, &py, &pz);
+  params.periodic[0] = px; params.periodic[1] = py; params.periodic[2] = pz;
+  double dlo[3], dhi[3];
+  cello::hierarchy()->lower(dlo, dlo+1, dlo+2);
+  cello::hierarchy()->upper(dhi, dhi+1, dhi+2);
+  for (int d = 0; d < 3; d++) params.dom_width[d] = dhi[d] - dlo[d];
+  return params;
+}
+
+/// Gravitating particles of a Block as a contiguous point list. `offsets`
+/// records where each (type, batch) starts in the list.
+void gather_sources
+(Particle particle, std::vector<double> & sx, std::vector<double> & sy,
+ std::vector<double> & sz, std::vector<double> & sm,
+ std::map<std::pair<int,int>, int> & offsets)
+{
+  ParticleDescr * particle_descr = cello::particle_descr();
+  Grouping * particle_groups = particle_descr->groups();
+  const int num_is_grav = particle_groups->size("is_gravitating");
+
+  for (int ipt = 0; ipt < num_is_grav; ipt++) {
+
+    const int it = particle.type_index(particle_groups->item("is_gravitating",ipt));
+
+    for (int ib = 0; ib < particle.num_batches(it); ib++) {
+
+      const int np = particle.num_particles(it,ib);
+      offsets[std::make_pair(it,ib)] = (int) sx.size();
+
+      int dm;
+      enzo_float * m;
+      if (particle.has_attribute(it,"mass")) {
+        const int imass = particle.attribute_index(it,"mass");
+        m = (enzo_float *) particle.attribute_array(it, imass, ib);
+        dm = particle.stride(it,imass);
+      } else {
+        const int imass = particle.constant_index(it,"mass");
+        m = (enzo_float *) particle.constant_value(it,imass);
+        dm = 0;
+      }
+
+      const int ia_x = particle.attribute_index(it,"x");
+      const int ia_y = particle.attribute_index(it,"y");
+      const int ia_z = particle.attribute_index(it,"z");
+      enzo_float * xa = (enzo_float *) particle.attribute_array(it,ia_x,ib);
+      enzo_float * ya = (enzo_float *) particle.attribute_array(it,ia_y,ib);
+      enzo_float * za = (enzo_float *) particle.attribute_array(it,ia_z,ib);
+      const int dx = particle.stride(it,ia_x);
+      const int dy = particle.stride(it,ia_y);
+      const int dz = particle.stride(it,ia_z);
+
+      for (int ip = 0; ip < np; ip++) {
+        sx.push_back(xa[ip*dx]); sy.push_back(ya[ip*dy]);
+        sz.push_back(za[ip*dz]); sm.push_back(m[ip*dm]);
+      }
+    }
+  }
+}
+
+/// All particles of a Block (the targets of the direct sums) as a point list,
+/// with pointers to their acceleration attributes. If `src_offsets` is given
+/// (this Block is also the source), `exclude[t]` is set to the index of the
+/// same particle in the source list, or -1.
+void gather_targets
+(Particle particle, std::vector<double> & tx, std::vector<double> & ty,
+ std::vector<double> & tz, std::vector<TargetBatch> & batches,
+ const std::map<std::pair<int,int>, int> * src_offsets,
+ std::vector<int> * exclude)
+{
+  const int num_prtl_types = cello::particle_descr()->num_types();
+
+  for (int it = 0; it < num_prtl_types; it++) {
+
+    for (int ib = 0; ib < particle.num_batches(it); ib++) {
+
+      const int np = particle.num_particles(it,ib);
+
+      const int ia_x  = particle.attribute_index(it,"x");
+      const int ia_y  = particle.attribute_index(it,"y");
+      const int ia_z  = particle.attribute_index(it,"z");
+      const int ia_ax = particle.attribute_index(it,"ax");
+      const int ia_ay = particle.attribute_index(it,"ay");
+      const int ia_az = particle.attribute_index(it,"az");
+
+      enzo_float * xa = (enzo_float *) particle.attribute_array(it,ia_x,ib);
+      enzo_float * ya = (enzo_float *) particle.attribute_array(it,ia_y,ib);
+      enzo_float * za = (enzo_float *) particle.attribute_array(it,ia_z,ib);
+      const int dx = particle.stride(it,ia_x);
+      const int dy = particle.stride(it,ia_y);
+      const int dz = particle.stride(it,ia_z);
+
+      TargetBatch tb;
+      tb.np = np; tb.offset = tx.size();
+      tb.ax = (enzo_float *) particle.attribute_array(it,ia_ax,ib);
+      tb.ay = (enzo_float *) particle.attribute_array(it,ia_ay,ib);
+      tb.az = (enzo_float *) particle.attribute_array(it,ia_az,ib);
+      tb.dax = particle.stride(it,ia_ax);
+      tb.day = particle.stride(it,ia_ay);
+      tb.daz = particle.stride(it,ia_az);
+      batches.push_back(tb);
+
+      int base = -1;
+      if (src_offsets) {
+        auto f = src_offsets->find(std::make_pair(it,ib));
+        if (f != src_offsets->end()) base = f->second;
+      }
+
+      for (int ip = 0; ip < np; ip++) {
+        tx.push_back(xa[ip*dx]); ty.push_back(ya[ip*dy]); tz.push_back(za[ip*dz]);
+        if (exclude) exclude->push_back(base >= 0 ? base + ip : -1);
+      }
+    }
+  }
+}
+
+/// Cell geometry and density of a block (m: allocated dimensions, g: ghost
+/// depths, h: cell widths, lo: lower corner)
+fmm_direct::CellGrid make_cell_grid
+(const int * m, const int * g, const double * h, const double * lo,
+ const double * dens)
+{
+  fmm_direct::CellGrid c;
+  c.nx = m[0]-2*g[0]; c.ny = m[1]-2*g[1]; c.nz = m[2]-2*g[2];
+  c.mx = m[0]; c.my = m[1]; c.mz = m[2];
+  c.gx = g[0]; c.gy = g[1]; c.gz = g[2];
+  for (int d = 0; d < 3; d++) { c.h[d] = h[d]; c.lo[d] = lo[d]; }
+  c.dens = dens;
+  return c;
+}
+
+/// Add the acceleration on all cells and particles of Block a due to the
+/// cells and gravitating particles of Block b. If `self` the two Blocks are
+/// the same and a cell/particle's interaction with itself is omitted
+/// (`exclude` maps each target particle to its entry in the source list).
+template <class Ew>
+void direct_sums
+(const fmm_direct::Params & params, const Ew & ew,
+ const fmm_direct::CellGrid & cells_a, const fmm_direct::CellGrid & cells_b,
+ enzo_float * accel_x, enzo_float * accel_y, enzo_float * accel_z,
+ const std::vector<double> & ptx, const std::vector<double> & pty,
+ const std::vector<double> & ptz, const std::vector<TargetBatch> & batches,
+ const std::vector<double> & psx, const std::vector<double> & psy,
+ const std::vector<double> & psz, const std::vector<double> & psm,
+ bool self = false, const std::vector<int> * exclude = nullptr)
+{
+  using namespace fmm_direct;
+
+  const int npt = (int) ptx.size();
+
+  PointSet tgt, src;
+  tgt.n = npt; tgt.x = ptx.data(); tgt.y = pty.data(); tgt.z = ptz.data();
+  src.n = (int) psm.size(); src.x = psx.data(); src.y = psy.data();
+  src.z = psz.data(); src.m = psm.data();
+  const int * excl = (self && exclude) ? exclude->data() : nullptr;
+
+  std::vector<double> tax(npt,0.0), tay(npt,0.0), taz(npt,0.0);
+
+  accumulate_block_pair_direct(params, ew, cells_a, cells_b, self,
+                               accel_x, accel_y, accel_z,
+                               tgt, tax.data(), tay.data(), taz.data(),
+                               src, excl);
+
+  for (const TargetBatch & tb : batches) {
+    for (int ip = 0; ip < tb.np; ip++) {
+      tb.ax[ip*tb.dax] += tax[tb.offset + ip];
+      tb.ay[ip*tb.day] += tay[tb.offset + ip];
+      tb.az[ip*tb.daz] += taz[tb.offset + ip];
+    }
+  }
+}
+
+} // anonymous namespace
+
 void EnzoMethodMultipole::evaluate_force_(Block * block) throw()
 {
   Data * data = block->data();
@@ -1301,224 +1509,34 @@ void EnzoMethodMultipole::evaluate_force_(Block * block) throw()
 
   // CkPrintf("grav_constant: %f\n", grav_const);
   
-  // loop over all cells
+  // far-field acceleration on each cell from the Taylor coefficients
   for (int iz = gz; iz < mz-gz; iz++) {
     for (int iy = gy; iy < my-gy; iy++) {
       for (int ix = gx; ix < mx-gx; ix++) {
 
         int i = ix + mx*(iy + my*iz);
 
-        // compute force sourced from other Blocks
         std::array<double, 3> a;
-        a[0] = (lo[0] + (ix-gx + 0.5)*hx) - com[0]; 
+        a[0] = (lo[0] + (ix-gx + 0.5)*hx) - com[0];
         a[1] = (lo[1] + (iy-gy + 0.5)*hy) - com[1];
         a[2] = (lo[2] + (iz-gz + 0.5)*hz) - com[2];
-        
+
         std::array<double, 3> second_term = dot_12_(a, c2);
         std::array<double, 3> third_term = dot_23_(outer_11_(a, a), dot_scalar_3_(0.5, c3));
 
         std::array<double, 3> block_force = add_11_(subtract_(c1, second_term), third_term);
 
-        // CkPrintf("first term: %f, %f, %f\n", c1[0], c1[1], c1[2]);
-        // CkPrintf("c2: %f, %f, %f, %f, %f, %f\n", c2[0], c2[1], c2[2], c2[3], c2[4], c2[5]);
-	      // CkPrintf("a: %f, %f, %f\n", a[0], a[1], a[2]);
-        // CkPrintf("second term: %f, %f, %f\n", second_term[0], second_term[1], second_term[2]);
-        // CkPrintf("third term: %f, %f, %f\n", third_term[0], third_term[1], third_term[2]);
-
-
-        // subtracting rather than adding since block_force is multiplied by -G 
+        // subtracting rather than adding since block_force is multiplied by -G
         accel_x[i] -= grav_const * block_force[0];
         accel_y[i] -= grav_const * block_force[1];
         accel_z[i] -= grav_const * block_force[2];
-
-        // CkPrintf("position: %f, %f, %f\n", (lo[0] + (ix-gx + 0.5)*hx), (lo[1] + (iy-gy + 0.5)*hy), (lo[2] + (iz-gz + 0.5)*hz));
-        // CkPrintf("Block force: %f, %f, %f\n", -1*grav_const*block_force[0], -1*grav_const*block_force[1], -1*grav_const*block_force[2]);
-
-        std::array<double, 3> tot_cell_force = {}; // for debugging purposes
-
-        // compute force sourced from other cells
-        for (int iz2 = gz; iz2 < mz-gz; iz2++) {
-          for (int iy2 = gy; iy2 < my-gy; iy2++) {
-            for (int ix2 = gx; ix2 < mx-gx; ix2++) {
-
-              int i2 = ix2 + mx*(iy2 + my*iz2);
-
-              if (i != i2) {
-
-                std::array<double, 3> disp;
-
-                double b_mass = dens[i2]*cell_vol;
-                // CkPrintf("b_mass: %f\n", b_mass);
-                
-                if (ewald_ != nullptr) {
-
-                  double a_loc[3]{lo[0] + (ix-gx + 0.5)*hx, lo[1] + (iy-gy + 0.5)*hy, lo[2] + (iz-gz + 0.5)*hz};
-                  double b_loc[3]{lo[0] + (ix2-gx + 0.5)*hx, lo[1] + (iy2-gy + 0.5)*hy, lo[2] + (iz2-gz + 0.5)*hz};
-                  double b_image[3];
-                  cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                  // CkPrintf("a_loc: %f, %f, %f\n", a_loc[0], a_loc[1], a_loc[2]);
-                  // CkPrintf("b_loc: %f, %f, %f\n", b_loc[0], b_loc[1], b_loc[2]);
-                  // CkPrintf("b_image: %f, %f, %f\n", b_image[0], b_image[1], b_image[2]);
-                
-                  // displacement vector pointing from current cell to interacting cell
-                  const int rank = cello::rank();
-                  disp[0] = b_image[0] - a_loc[0];
-                  disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                  disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                  // acceleration contribution from periodic images of particle b
-                  std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                  // should i be subtracting or adding?
-                  // minus sign from negative gradient * minus sign from chain rule
-                  accel_x[i] += grav_const * b_mass * d1_ewald[0];
-                  accel_y[i] += grav_const * b_mass * d1_ewald[1];
-                  accel_z[i] += grav_const * b_mass * d1_ewald[2];
-
-                  tot_cell_force[0] += grav_const * b_mass * d1_ewald[0];
-                  tot_cell_force[1] += grav_const * b_mass * d1_ewald[1];
-                  tot_cell_force[2] += grav_const * b_mass * d1_ewald[2];
-
-                  // if ((iz == gz) && (iz2==gz) && (ix-gx==3) && (iy-gy==20)) {
-                  //    CkPrintf("(%d, %d, %f) periodic force: (%f, %f); accel: (%.9f, %.9f)\n",
-                  //    ix2-gx, iy2-gy, dens[i2],
-                  //    grav_const * b_mass * d1_ewald[0], 
-                  //    grav_const * b_mass * d1_ewald[1], 
-                  //    accel_x[i], accel_y[i]);
-                  // }
-                }
-                else {
-                  disp[0] = (ix2 - ix) * hx;
-                  disp[1] = (iy2 - iy) * hy;
-                  disp[2] = (iz2 - iz) * hz;
-                }
-                
-                std::array<double, 3> cell_force = newton_force_(b_mass, disp); 
-
-                // CkPrintf("nonperiodic force: %f, %f, %f\n", 
-                //     grav_const*cell_force[0], grav_const*cell_force[1], grav_const*cell_force[2]);
-
-                accel_x[i] += grav_const * cell_force[0];
-                accel_y[i] += grav_const * cell_force[1];
-                accel_z[i] += grav_const * cell_force[2];
-
-                tot_cell_force[0] += grav_const * cell_force[0];
-                tot_cell_force[1] += grav_const * cell_force[1];
-                tot_cell_force[2] += grav_const * cell_force[2];
-
-                // if ((iz == gz) && (iz2==gz) && (ix-gx==3) && (iy-gy==20)) {
-                //      CkPrintf("(%d, %d, %f) nonperiodic force: (%f, %f); accel: (%.9f, %.9f)\n",
-                //      ix2-gx, iy2-gy, dens[i2], 
-                //      grav_const * cell_force[0], 
-                //      grav_const * cell_force[1], 
-                //      accel_x[i], accel_y[i]);
-                //   }
-
-              }
-            }
-          }
-        }
-	      // CkPrintf("Cell loc: %f, %f, %f\n", lo[0] + (ix-gx + 0.5)*hx, lo[1] + (iy-gy + 0.5)*hy, lo[2] + (iz-gz + 0.5)*hz);   
-        // CkPrintf("Cell force: %f, %f, %f\n", tot_cell_force[0], tot_cell_force[1], tot_cell_force[2]);
-        // CkPrintf("Cell accel: %f, %f, %f\n", accel_x[i], accel_y[i], accel_z[i]);
-
-        std::array<double, 3> tot_prt_force = {}; // for debugging purposes
-
-        // compute cell force sourced from particles
-        for (int ipt = 0; ipt < num_is_grav; ipt++) {
-          const int it = particle.type_index(particle_groups->item("is_gravitating",ipt));
-
-          int imass2 = 0;
-
-          for (int ib = 0; ib < particle.num_batches(it); ib++) {
-
-            const int np = particle.num_particles(it,ib);
-
-            if (particle.has_attribute(it,"mass")) {
-              imass2 = particle.attribute_index(it,"mass");
-              prtmass2 = (enzo_float *) particle.attribute_array( it, imass2, ib);
-              dm2 = particle.stride(it,imass2);
-            } 
-            else {
-              imass2 = particle.constant_index(it,"mass");
-              prtmass2 = (enzo_float*)particle.constant_value(it,imass2);
-              dm2 = 0;
-            }
-
-            const int ia_x2  = particle.attribute_index(it,"x");
-            const int ia_y2  = particle.attribute_index(it,"y");
-            const int ia_z2  = particle.attribute_index(it,"z");
-
-            enzo_float * xa2 =  (enzo_float *)particle.attribute_array (it,ia_x2,ib);
-            enzo_float * ya2 =  (enzo_float *)particle.attribute_array (it,ia_y2,ib);
-            enzo_float * za2 =  (enzo_float *)particle.attribute_array (it,ia_z2,ib);
-
-            const int dx2 =  particle.stride(it,ia_x2);
-            const int dy2 =  particle.stride(it,ia_y2);
-            const int dz2 =  particle.stride(it,ia_z2);
-
-            for (int ip=0; ip < np; ip++) {
-              
-              // disp points from current cell to particle
-              std::array<double, 3> disp;
-              
-              if (ewald_ != nullptr) {
-                
-                double a_loc[3]{lo[0] + (ix-gx + 0.5)*hx, lo[1] + (iy-gy + 0.5)*hy, lo[2] + (iz-gz + 0.5)*hz};
-                double b_loc[3]{xa2[ip*dx2], ya2[ip*dy2], za2[ip*dz2]};
-                double b_image[3];
-                cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                const int rank = cello::rank();
-                disp[0] = b_image[0] - a_loc[0];
-                disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                // acceleration contribution from periodic images of Particle b
-                std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                accel_x[i] += grav_const * prtmass2[ip*dm2] * d1_ewald[0];
-                accel_y[i] += grav_const * prtmass2[ip*dm2] * d1_ewald[1];
-                accel_z[i] += grav_const * prtmass2[ip*dm2] * d1_ewald[2];
-
-                // tot_prt_force[0] += grav_const * prtmass2[ip*dm2] * d1_ewald[0];
-                // tot_prt_force[1] += grav_const * prtmass2[ip*dm2] * d1_ewald[1];
-                // tot_prt_force[2] += grav_const * prtmass2[ip*dm2] * d1_ewald[2];
-              }
-              else {
-                disp[0] = xa2[ip*dx2] - (lo[0] + (ix-gx + 0.5)*hx); 
-                disp[1] = ya2[ip*dy2] - (lo[1] + (iy-gy + 0.5)*hy);
-                disp[2] = za2[ip*dz2] - (lo[2] + (iz-gz + 0.5)*hz);
-              }
-                
-              std::array<double, 3> prtcell_force = newton_force_(prtmass2[ip*dm2], disp); 
-
-              accel_x[i] += grav_const * prtcell_force[0];
-              accel_y[i] += grav_const * prtcell_force[1];
-              accel_z[i] += grav_const * prtcell_force[2];
-
-              // tot_prt_force[0] += grav_const * prtcell_force[0];
-              // tot_prt_force[1] += grav_const * prtcell_force[1];
-              // tot_prt_force[2] += grav_const * prtcell_force[2];
-
-              // ALSO UPDATE GRAVITATING PARTICLE ACCELS HERE?
-            }
-          }
-        }
-
-        // CkPrintf("Particle force: %f, %f, %f\n", tot_prt_force[0], tot_prt_force[1], tot_prt_force[2]);
-        // CkPrintf("Accel: %f, %f, %f\n\n", accel_x[0], accel_y[0], accel_z[0]);
       }
     }
   }
 
-
-  // loop over all particles
-  // change this to loop over all particles, not just the ones that are gravitating (done?)
-
+  // far-field acceleration on each particle
   for (int it = 0; it < num_prtl_types; it++) {
-    
+
     for (int ib = 0; ib < particle.num_batches(it); ib++) {
 
       const int np = particle.num_particles(it,ib);
@@ -1546,193 +1564,51 @@ void EnzoMethodMultipole::evaluate_force_(Block * block) throw()
 
       for (int ip=0; ip < np; ip++) {
 
-        // compute force sourced by other blocks
         std::array<double, 3> a;
-        a[0] =  xa[ip*dx] - com[0]; 
+        a[0] =  xa[ip*dx] - com[0];
         a[1] =  ya[ip*dy] - com[1];
         a[2] =  za[ip*dz] - com[2];
 
         std::array<double, 3> second_term = dot_12_(a, c2);
         std::array<double, 3> third_term = dot_23_(outer_11_(a, a), dot_scalar_3_(0.5, c3));
 
-        // how does the code treat G?
         std::array<double, 3> block_force = add_11_(subtract_(c1, second_term), third_term);
 
-        // subtracting rather than adding since block_force is multiplied by -G
         axa[ip*dax] -= grav_const * block_force[0];
         aya[ip*day] -= grav_const * block_force[1];
         aza[ip*daz] -= grav_const * block_force[2];
-
-        //CkPrintf("position (prt): %f, %f, %f\n", xa[ip*dx], ya[ip*dy], za[ip*dz]);
-        //CkPrintf("Block force (prt): %f, %f, %f\n", -1.0*block_force[0], -1.0*block_force[1], -1.0*block_force[2]);
-
-        std::array<double, 3> tot_cell_force = {}; // for debugging purposes
-        
-        // compute force sourced by cells
-        for (int iz2 = gz; iz2 < mz-gz; iz2++) {
-          for (int iy2 = gy; iy2 < my-gy; iy2++) {
-            for (int ix2 = gx; ix2 < mx-gx; ix2++) {
-
-              int i2 = ix2 + mx*(iy2 + my*iz2);
-
-              // disp points from current particle to interacting cell
-              std::array<double, 3> disp;
-
-              double b_mass = dens[i2]*cell_vol;
-
-              // force from periodic images of Cell b
-              if (ewald_ != nullptr) {
-
-                double a_loc[3]{xa[ip*dx], ya[ip*dy], za[ip*dz]};
-                double b_loc[3]{lo[0] + (ix2-gx + 0.5)*hx, lo[1] + (iy2-gy + 0.5)*hy, lo[2] + (iz2-gz + 0.5)*hz};
-                double b_image[3];
-                cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                const int rank = cello::rank();
-                disp[0] = b_image[0] - a_loc[0];
-                disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                // acceleration contribution from periodic images of Cell b
-                std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                axa[ip*dax] += grav_const * b_mass * d1_ewald[0];
-                aya[ip*day] += grav_const * b_mass * d1_ewald[1];
-                aza[ip*daz] += grav_const * b_mass * d1_ewald[2];
-
-                // CkPrintf("cell->particle force (periodic): %f, %f, %f\n",
-                //     grav_const * b_mass * d1_ewald[0], grav_const * b_mass * d1_ewald[1], grav_const * b_mass * d1_ewald[2]);
-
-                // tot_cell_force[0] += grav_const * b_mass * d1_ewald[0];
-                // tot_cell_force[1] += grav_const * b_mass * d1_ewald[1];
-                // tot_cell_force[2] += grav_const * b_mass * d1_ewald[2];
-              }
-              else {
-                disp[0] = (lo[0] + (ix2-gx + 0.5)*hx) - xa[ip*dx]; 
-                disp[1] = (lo[1] + (iy2-gy + 0.5)*hy) - ya[ip*dy];
-                disp[2] = (lo[2] + (iz2-gz + 0.5)*hz) - za[ip*dz];
-              }
-                
-              std::array<double, 3> cellprt_force = newton_force_(b_mass, disp); 
-
-              axa[ip*dax] += grav_const * cellprt_force[0];
-              aya[ip*day] += grav_const * cellprt_force[1];
-              aza[ip*daz] += grav_const * cellprt_force[2];
-
-              // CkPrintf("cell->particle force (nonperiodic): %f, %f, %f\n", 
-              //     grav_const * cellprt_force[0], grav_const * cellprt_force[1], grav_const * cellprt_force[2]);
-
-              // tot_cell_force[0] += grav_const * cellprt_force[0];
-              // tot_cell_force[1] += grav_const * cellprt_force[1];
-              // tot_cell_force[2] += grav_const * cellprt_force[2];
-
-            }
-          }
-        }
-
-        //CkPrintf("Cell force (prt): %f, %f, %f\n", tot_cell_force[0], tot_cell_force[1], tot_cell_force[2]);
-
-        std::array<double, 3> tot_prt_force = {}; // for debugging purposes
-
-        // compute force sourced by other particles
-        for (int ipt2 = 0; ipt2 < num_is_grav; ipt2++) {
-          const int it2 = particle.type_index(particle_groups->item("is_gravitating",ipt2));
-
-          int imass2 = 0;
-
-          for (int ib2 = 0; ib2 < particle.num_batches(it2); ib2++) {
-
-            const int np2 = particle.num_particles(it2,ib2);
-
-            if (particle.has_attribute(it2,"mass")) {
-              imass2 = particle.attribute_index(it2,"mass");
-              prtmass2 = (enzo_float *) particle.attribute_array( it2, imass2, ib2);
-              dm2 = particle.stride(it2,imass2);
-            } 
-            else {
-              imass2 = particle.constant_index(it2,"mass");
-              prtmass2 = (enzo_float*)particle.constant_value(it2,imass2);
-              dm2 = 0;
-            }
-
-            const int ia_x2  = particle.attribute_index(it2,"x");
-            const int ia_y2  = particle.attribute_index(it2,"y");
-            const int ia_z2  = particle.attribute_index(it2,"z");
-
-            enzo_float * xa2 =  (enzo_float *)particle.attribute_array (it2,ia_x2,ib2);
-            enzo_float * ya2 =  (enzo_float *)particle.attribute_array (it2,ia_y2,ib2);
-            enzo_float * za2 =  (enzo_float *)particle.attribute_array (it2,ia_z2,ib2);
-
-            const int dx2 =  particle.stride(it2,ia_x2);
-            const int dy2 =  particle.stride(it2,ia_y2);
-            const int dz2 =  particle.stride(it2,ia_z2);
-
-            for (int ip2=0; ip2 < np2; ip2++) {
-
-              if (!(it == it2 && ib == ib2 && ip == ip2)) {
-              
-                // disp points from current particle to interacting particle
-                std::array<double, 3> disp;
-
-                // force from periodic images of Particle b
-                if (ewald_ != nullptr) {
-
-                  double a_loc[3]{xa[ip*dx], ya[ip*dy], za[ip*dz]};
-                  double b_loc[3]{xa2[ip2*dx2], ya2[ip2*dy2], za2[ip2*dz2]};
-                  double b_image[3];
-                  cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                  const int rank = cello::rank();
-                  disp[0] = b_image[0] - a_loc[0];
-                  disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                  disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                    
-                  // acceleration contribution from periodic images of Particle b
-                  std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                    
-                  axa[ip*dax] += grav_const * prtmass2[ip2*dm2] * d1_ewald[0];
-                  aya[ip*day] += grav_const * prtmass2[ip2*dm2] * d1_ewald[1];
-                  aza[ip*daz] += grav_const * prtmass2[ip2*dm2] * d1_ewald[2];
-
-                  // CkPrintf("particle->particle force (periodic): %f, %f, %f\n", 
-                  //     grav_const * prtmass2[ip2*dm2] * d1_ewald[0], grav_const * prtmass2[ip2*dm2] * d1_ewald[1], grav_const * prtmass2[ip2*dm2] * d1_ewald[2]);
-
-                  tot_prt_force[0] += grav_const * prtmass2[ip2*dm2] * d1_ewald[0];
-                  tot_prt_force[1] += grav_const * prtmass2[ip2*dm2] * d1_ewald[1];
-                  tot_prt_force[2] += grav_const * prtmass2[ip2*dm2] * d1_ewald[2];
-                }
-                else {
-                  disp[0] = xa2[ip2*dx2] - xa[ip*dx]; 
-                  disp[1] = ya2[ip2*dy2] - ya[ip*dy];
-                  disp[2] = za2[ip2*dz2] - za[ip*dz];
-                }
-                  
-                std::array<double, 3> prtprt_force = newton_force_(prtmass2[ip2*dm2], disp); 
-
-                axa[ip*dax] += grav_const * prtprt_force[0];
-                aya[ip*day] += grav_const * prtprt_force[1];
-                aza[ip*daz] += grav_const * prtprt_force[2];
-
-                // CkPrintf("particle->particle force (nonperiodic): %f, %f, %f\n", 
-                //       grav_const * prtprt_force[0], grav_const * prtprt_force[1], grav_const * prtprt_force[2]);
-
-                tot_prt_force[0] += grav_const * prtprt_force[0];
-                tot_prt_force[1] += grav_const * prtprt_force[1];
-                tot_prt_force[2] += grav_const * prtprt_force[2];
-              }
-
-            }
-          }
-        }
-
-        // CkPrintf("TOTAL PARTICLE FORCE: %.12f, %.12f, %.12f\n", tot_prt_force[0], tot_prt_force[1], tot_prt_force[2]);
-        //CkPrintf("Accel (prt): %f, %f, %f\n\n", axa[ip*dax], aya[ip*day], aza[ip*daz]);
-
       }
     }
   }
 
-} 
+  // near-field: direct sums over the cells and particles of this Block
+  // (every cell and particle with every other, excluding itself)
+  const fmm_direct::Params params = direct_params(eps0_, grav_const);
+
+  std::vector<double> dens_d (dens, dens + (size_t)mx*my*mz);
+  const int m_[3] = {mx, my, mz}, g_[3] = {gx, gy, gz};
+  const double h_[3] = {hx, hy, hz};
+  const fmm_direct::CellGrid cells = make_cell_grid(m_, g_, h_, lo, dens_d.data());
+
+  std::vector<double> psx, psy, psz, psm;
+  std::map<std::pair<int,int>, int> src_offsets;
+  gather_sources(particle, psx, psy, psz, psm, src_offsets);
+
+  std::vector<double> ptx, pty, ptz;
+  std::vector<int> exclude;
+  std::vector<TargetBatch> batches;
+  gather_targets(particle, ptx, pty, ptz, batches, &src_offsets, &exclude);
+
+  if (ewald_ != nullptr) {
+    direct_sums (params, EwaldD1(ewald_), cells, cells,
+                 accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
+                 psx, psy, psz, psm, true, &exclude);
+  } else {
+    direct_sums (params, fmm_direct::NoEwald(), cells, cells,
+                 accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
+                 psx, psy, psz, psm, true, &exclude);
+  }
+}
 
 /************************************************************************/
 
@@ -2162,6 +2038,7 @@ void EnzoMethodMultipole::pack_dens_(EnzoBlock * enzo_block, Index index_b, int 
 }
 
 
+
 void EnzoMethodMultipole::interact_direct_(Block * block, char * fldbuffer_b, char * prtbuffer_b) throw()
 {
 
@@ -2236,320 +2113,33 @@ void EnzoMethodMultipole::interact_direct_(Block * block, char * fldbuffer_b, ch
   }
 
 
-  // loop over all cells in this Block
-  for (int iz = gz; iz < mz-gz; iz++) {
-    for (int iy = gy; iy < my-gy; iy++) {
-      for (int ix = gx; ix < mx-gx; ix++) {
+  // The direct sums are evaluated by the functions in
+  // EnzoMethodMultipoleDirect.hpp
 
-        int i = ix + mx*(iy + my*iz);
+  const fmm_direct::Params params = direct_params(eps0_, grav_const);
 
-	// CkPrintf("position: %f, %f, %f\n", (lo[0] + (ix-gx + 0.5)*hx), (lo[1] + (iy-gy + 0.5)*hy), (lo[2] + (iz-gz + 0.5)*hz));
+  const int m_a[3] = {mx, my, mz}, m_b[3] = {mx2, my2, mz2};
+  const int g_[3] = {gx, gy, gz};
+  const double h_a[3] = {hx, hy, hz}, h_b[3] = {hx2, hy2, hz2};
+  const fmm_direct::CellGrid cells_a = make_cell_grid(m_a, g_, h_a, lo, nullptr);
+  const fmm_direct::CellGrid cells_b = make_cell_grid(m_b, g_, h_b, lo2, dens);
 
-        std::array<double, 3> tot_cell_force = {}; // for debugging
+  std::vector<double> psx, psy, psz, psm;
+  std::map<std::pair<int,int>, int> src_offsets;
+  gather_sources(particle2, psx, psy, psz, psm, src_offsets);
 
-        // compute force sourced from cells in Block b
-        for (int iz2 = gz; iz2 < mz2-gz; iz2++) {
-          for (int iy2 = gy; iy2 < my2-gy; iy2++) {
-            for (int ix2 = gx; ix2 < mx2-gx; ix2++) {
+  std::vector<double> ptx, pty, ptz;
+  std::vector<TargetBatch> batches;
+  gather_targets(particle, ptx, pty, ptz, batches, nullptr, nullptr);
 
-              int i2 = ix2 + mx2*(iy2 + my2*iz2);
-
-              // CkPrintf("position2: %f, %f, %f\n", (lo2[0] + (ix2-gx + 0.5)*hx2), (lo2[1] + (iy2-gy + 0.5)*hy2), (lo2[2] + (iz2-gz + 0.5)*hz2));
-
-              // disp points from cell in current Block to cell in Block b
-              std::array<double, 3> disp;
-
-              double b_mass = dens[i2]*hx2*hy2*hz2;
-                
-              // force from periodic images of Cell b
-              if (ewald_ != nullptr) {
-
-                double a_loc[3]{lo[0] + (ix-gx + 0.5)*hx, lo[1] + (iy-gy + 0.5)*hy, lo[2] + (iz-gz + 0.5)*hz};
-                double b_loc[3]{lo2[0] + (ix2-gx + 0.5)*hx2, lo2[1] + (iy2-gy + 0.5)*hy2, lo2[2] + (iz2-gz + 0.5)*hz2};
-                double b_image[3];
-                cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                // CkPrintf("a_loc: %f, %f, %f\n", a_loc[0], a_loc[1], a_loc[2]);
-                // CkPrintf("b_loc: %f, %f, %f\n", b_loc[0], b_loc[1], b_loc[2]);
-                // CkPrintf("b_image: %f, %f, %f\n", b_image[0], b_image[1], b_image[2]);
-                
-                // displacement vector pointing from current cell to interacting cell
-                const int rank = cello::rank();
-                disp[0] = b_image[0] - a_loc[0];
-                disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                // acceleration contribution from periodic images of Cell b
-                std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                // should i be subtracting or adding?
-                // minus sign from negative gradient * minus sign from chain rule
-                accel_x[i] += grav_const * b_mass * d1_ewald[0];
-                accel_y[i] += grav_const * b_mass * d1_ewald[1];
-                accel_z[i] += grav_const * b_mass * d1_ewald[2];
-
-                tot_cell_force[0] += grav_const * b_mass * d1_ewald[0];
-                tot_cell_force[1] += grav_const * b_mass * d1_ewald[1];
-                tot_cell_force[2] += grav_const * b_mass * d1_ewald[2];
-              }
-              else {
-                disp[0] = lo2[0] - lo[0] + (ix2-gx + 0.5)*hx2 - (ix-gx + 0.5)*hx; 
-                disp[1] = lo2[1] - lo[1] + (iy2-gy + 0.5)*hy2 - (iy-gy + 0.5)*hy;
-                disp[2] = lo2[2] - lo[2] + (iz2-gz + 0.5)*hz2 - (iz-gz + 0.5)*hz;
-              }
-              
-
-              // CkPrintf("disp: %f, %f, %f\n", disp[0], disp[1], disp[2]);
-                
-              std::array<double, 3> cell_force = newton_force_(b_mass, disp); 
-
-              accel_x[i] += grav_const * cell_force[0];
-              accel_y[i] += grav_const * cell_force[1];
-              accel_z[i] += grav_const * cell_force[2];
-
-              tot_cell_force[0] += grav_const * cell_force[0];
-              tot_cell_force[1] += grav_const * cell_force[1];
-              tot_cell_force[2] += grav_const * cell_force[2];
-            }
-          }
-        }
-	      // CkPrintf("Cell loc: %f, %f, %f\n", lo[0] + (ix-gx + 0.5)*hx, lo[1] + (iy-gy + 0.5)*hy, lo[2] + (iz-gz + 0.5)*hz);
-        // CkPrintf("Leaf-leaf cell force: %f, %f, %f\n", tot_cell_force[0], tot_cell_force[1], tot_cell_force[2]);
-        //CkPrintf("Acceleration: %f, %f, %f\n\n", accel_x[i], accel_y[i], accel_z[i]);
-
-        // compute cell force sourced from particles in Block b
-        for (int ipt = 0; ipt < num_is_grav; ipt++) {
-
-          const int it = particle2.type_index(particle_groups->item("is_gravitating",ipt));
-
-          int imass2 = 0;
-
-          for (int ib = 0; ib < particle2.num_batches(it); ib++) {
-
-            const int np = particle2.num_particles(it,ib);
-
-            if (particle2.has_attribute(it,"mass")) {
-              imass2 = particle2.attribute_index(it,"mass");
-              prtmass2 = (enzo_float *) particle2.attribute_array( it, imass2, ib);
-              dm2 = particle2.stride(it,imass2);
-            } 
-            else {
-              imass2 = particle2.constant_index(it,"mass");
-              prtmass2 = (enzo_float*)particle2.constant_value(it,imass2);
-              dm2 = 0;
-            }
-
-            const int ia_x2  = particle2.attribute_index(it,"x");
-            const int ia_y2  = particle2.attribute_index(it,"y");
-            const int ia_z2  = particle2.attribute_index(it,"z");
-
-            enzo_float * xa2 =  (enzo_float *)particle2.attribute_array (it,ia_x2,ib);
-            enzo_float * ya2 =  (enzo_float *)particle2.attribute_array (it,ia_y2,ib);
-            enzo_float * za2 =  (enzo_float *)particle2.attribute_array (it,ia_z2,ib);
-
-            const int dx2 =  particle2.stride(it,ia_x2);
-            const int dy2 =  particle2.stride(it,ia_y2);
-            const int dz2 =  particle2.stride(it,ia_z2);
-
-            for (int ip=0; ip < np; ip++) {
-              
-              // disp points from cell in current Block to particle in Block b
-              std::array<double, 3> disp;
-              
-              // force from periodic images of Particle b
-              if (ewald_ != nullptr) {
-                
-                double a_loc[3]{lo[0] + (ix-gx + 0.5)*hx, lo[1] + (iy-gy + 0.5)*hy, lo[2] + (iz-gz + 0.5)*hz};
-                double b_loc[3]{xa2[ip*dx2], ya2[ip*dy2], za2[ip*dz2]};
-                double b_image[3];
-                cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                const int rank = cello::rank();
-                disp[0] = b_image[0] - a_loc[0];
-                disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                // acceleration contribution from periodic images of Particle b
-                std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                accel_x[i] += grav_const * prtmass2[ip*dm2] * d1_ewald[0];
-                accel_y[i] += grav_const * prtmass2[ip*dm2] * d1_ewald[1];
-                accel_z[i] += grav_const * prtmass2[ip*dm2] * d1_ewald[2];
-              }
-              else {
-                disp[0] = xa2[ip*dx2] - (lo[0] + (ix-gx + 0.5)*hx); 
-                disp[1] = ya2[ip*dy2] - (lo[1] + (iy-gy + 0.5)*hy);
-                disp[2] = za2[ip*dz2] - (lo[2] + (iz-gz + 0.5)*hz);
-              }
-                
-              std::array<double, 3> prtcell_force = newton_force_(prtmass2[ip*dm2], disp); 
-
-              accel_x[i] += grav_const * prtcell_force[0];
-              accel_y[i] += grav_const * prtcell_force[1];
-              accel_z[i] += grav_const * prtcell_force[2];
-
-            }
-          }
-        }
-      }
-    }
-  }
-
-
-  // loop over all particles in this Block
-  for (int it = 0; it < num_prtl_types; it++) {
-
-    for (int ib = 0; ib < particle.num_batches(it); ib++) {
-
-      const int np = particle.num_particles(it,ib);
-
-      const int ia_x  = particle.attribute_index(it,"x");
-      const int ia_y  = particle.attribute_index(it,"y");
-      const int ia_z  = particle.attribute_index(it,"z");
-      const int ia_ax  = particle.attribute_index(it,"ax");
-      const int ia_ay  = particle.attribute_index(it,"ay");
-      const int ia_az  = particle.attribute_index(it,"az");
-
-      enzo_float * xa =  (enzo_float *)particle.attribute_array (it,ia_x,ib);
-      enzo_float * ya =  (enzo_float *)particle.attribute_array (it,ia_y,ib);
-      enzo_float * za =  (enzo_float *)particle.attribute_array (it,ia_z,ib);
-      enzo_float * axa =  (enzo_float *)particle.attribute_array (it,ia_ax,ib);
-      enzo_float * aya =  (enzo_float *)particle.attribute_array (it,ia_ay,ib);
-      enzo_float * aza =  (enzo_float *)particle.attribute_array (it,ia_az,ib);
-
-      const int dx =  particle.stride(it,ia_x);
-      const int dy =  particle.stride(it,ia_y);
-      const int dz =  particle.stride(it,ia_z);
-      const int dax =  particle.stride(it,ia_ax);
-      const int day =  particle.stride(it,ia_ay);
-      const int daz =  particle.stride(it,ia_az);
-
-      for (int ip=0; ip < np; ip++) {
-        
-        // compute force sourced by cells in Block b
-        for (int iz2 = gz; iz2 < mz2-gz; iz2++) {
-          for (int iy2 = gy; iy2 < my2-gy; iy2++) {
-            for (int ix2 = gx; ix2 < mx2-gx; ix2++) {
-
-              int i2 = ix2 + mx2*(iy2 + my2*iz2);
-
-              // disp points from particle in current Block to cell in Block b
-              std::array<double, 3> disp;
-
-              double b_mass = dens[i2]*hx2*hy2*hz2;
-
-              // force from periodic images of Cell b
-              if (ewald_ != nullptr) {
-
-                double a_loc[3]{xa[ip*dx], ya[ip*dy], za[ip*dz]};
-                double b_loc[3]{lo2[0] + (ix2-gx + 0.5)*hx2, lo2[1] + (iy2-gy + 0.5)*hy2, lo2[2] + (iz2-gz + 0.5)*hz2};
-                double b_image[3];
-                cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                const int rank = cello::rank();
-                disp[0] = b_image[0] - a_loc[0];
-                disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                // acceleration contribution from periodic images of Cell b
-                std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                axa[ip*dax] += grav_const * b_mass * d1_ewald[0];
-                aya[ip*day] += grav_const * b_mass * d1_ewald[1];
-                aza[ip*daz] += grav_const * b_mass * d1_ewald[2];
-              }
-              else {
-                disp[0] = (lo2[0] + (ix2-gx + 0.5)*hx2) - xa[ip*dx]; 
-                disp[1] = (lo2[1] + (iy2-gy + 0.5)*hy2) - ya[ip*dy];
-                disp[2] = (lo2[2] + (iz2-gz + 0.5)*hz2) - za[ip*dz];
-              }
-
-              std::array<double, 3> cellprt_force = newton_force_(b_mass, disp); 
-
-              axa[ip*dax] += grav_const * cellprt_force[0];
-              aya[ip*day] += grav_const * cellprt_force[1];
-              aza[ip*daz] += grav_const * cellprt_force[2];
-
-            }
-          }
-        }
-
-        // compute force sourced by particles in Block b
-        for (int ipt2 = 0; ipt2 < num_is_grav; ipt2++) {
-          const int it2 = particle2.type_index(particle_groups->item("is_gravitating",ipt2));
-
-          int imass2 = 0;
-
-          for (int ib2 = 0; ib2 < particle2.num_batches(it2); ib2++) {
-
-            const int np2 = particle2.num_particles(it2,ib2);
-
-            if (particle2.has_attribute(it2,"mass")) {
-              imass2 = particle2.attribute_index(it2,"mass");
-              prtmass2 = (enzo_float *) particle2.attribute_array( it2, imass2, ib2);
-              dm2 = particle2.stride(it2,imass2);
-            } 
-            else {
-              imass2 = particle2.constant_index(it2,"mass");
-              prtmass2 = (enzo_float*)particle2.constant_value(it2,imass2);
-              dm2 = 0;
-            }
-
-            const int ia_x2  = particle2.attribute_index(it2,"x");
-            const int ia_y2  = particle2.attribute_index(it2,"y");
-            const int ia_z2  = particle2.attribute_index(it2,"z");
-
-            enzo_float * xa2 =  (enzo_float *)particle2.attribute_array (it2,ia_x2,ib2);
-            enzo_float * ya2 =  (enzo_float *)particle2.attribute_array (it2,ia_y2,ib2);
-            enzo_float * za2 =  (enzo_float *)particle2.attribute_array (it2,ia_z2,ib2);
-
-            const int dx2 =  particle2.stride(it2,ia_x2);
-            const int dy2 =  particle2.stride(it2,ia_y2);
-            const int dz2 =  particle2.stride(it2,ia_z2);
-
-            for (int ip2=0; ip2 < np2; ip2++) {
-              
-              // disp points from particle in current Block to particle in Block b
-              std::array<double, 3> disp;
-
-              // force from periodic images of Particle b
-              if (ewald_ != nullptr) {
-
-                double a_loc[3]{xa[ip*dx], ya[ip*dy], za[ip*dz]};
-                double b_loc[3]{xa2[ip2*dx2], ya2[ip2*dy2], za2[ip2*dz2]};
-                double b_image[3];
-                cello::hierarchy()->get_nearest_periodic_image(b_loc, a_loc, b_image);
-
-                const int rank = cello::rank();
-                disp[0] = b_image[0] - a_loc[0];
-                disp[1] = (rank < 2) ? 0 : b_image[1] - a_loc[1];
-                disp[2] = (rank < 3) ? 0 : b_image[2] - a_loc[2];
-                  
-                // acceleration contribution from periodic images of Particle b
-                std::array<double, 3> d1_ewald = ewald_->interp_d1(disp[0], disp[1], disp[2]); 
-                  
-                axa[ip*dax] += grav_const * prtmass2[ip2*dm2] * d1_ewald[0];
-                aya[ip*day] += grav_const * prtmass2[ip2*dm2] * d1_ewald[1];
-                aza[ip*daz] += grav_const * prtmass2[ip2*dm2] * d1_ewald[2];
-              }
-              else {
-                disp[0] = xa2[ip2*dx2] - xa[ip*dx]; 
-                disp[1] = ya2[ip2*dy2] - ya[ip*dy];
-                disp[2] = za2[ip2*dz2] - za[ip*dz];
-              }
-
-              std::array<double, 3> prtprt_force = newton_force_(prtmass2[ip2*dm2], disp); 
-
-              axa[ip*dax] += grav_const * prtprt_force[0];
-              aya[ip*day] += grav_const * prtprt_force[1];
-              aza[ip*daz] += grav_const * prtprt_force[2];
-
-            }
-          }
-        }
-
-      }
-    }
+  if (ewald_ != nullptr) {
+    direct_sums (params, EwaldD1(ewald_), cells_a, cells_b,
+                 accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
+                 psx, psy, psz, psm);
+  } else {
+    direct_sums (params, fmm_direct::NoEwald(), cells_a, cells_b,
+                 accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
+                 psx, psy, psz, psm);
   }
 
   // compute long-range contribution from periodic images of Block b
