@@ -218,6 +218,87 @@ void accumulate_cells_cells (const Params & p, const Ew & ew,
   }
 }
 
+inline bool same_spacing (const CellGrid & a, const CellGrid & b)
+{
+  for (int d = 0; d < 3; d++)
+    if (std::fabs(a.h[d] - b.h[d]) > 1e-12*a.h[d]) return false;
+  return true;
+}
+
+
+/// wrap an integer cell offset into [-Ne/2, ceil(Ne/2)-1] with the same
+/// tie-breaking as wrapped_disp, and return the table index along the axis
+inline long wrapped_index (long o, long Ne)
+{
+  long r = o % Ne; if (r < 0) r += Ne;
+  const long w = (2*r < Ne) ? r : r - Ne;
+  return w + Ne/2;
+}
+
+//----------------------------------------------------------------------
+// Pairs of blocks of different resolution (cell widths differing by a power
+// of two R = 2^s, as happens across refinement interfaces).
+//
+// All cell centers sit on a common lattice of spacing u = h_fine/2: for a cell
+// i of A and j of B the displacement is, in units of u,
+//     D = LO + (2j+1) Rb - (2i+1) Ra ,   Ra = h_a/h_fine, Rb = h_b/h_fine
+// (one of Ra, Rb is 1 and the other R). Splitting the fine block's cells by
+// index modulo R makes D a function of the index difference within each of
+// the R^3 classes, so each class is an ordinary convolution, exactly as in
+// the equal-resolution case.
+
+struct MixedGeom {
+  bool ok = false;
+  bool a_fine = false;       // true: A has the smaller cells
+  long R = 1;
+  double u[3];               // lattice spacing
+  long LO[3];                // (b.lo - a.lo)/u
+  long Ne[3] = {0,0,0};      // domain width in units of u (periodic axes)
+  bool wrap[3] = {false,false,false};
+};
+
+template <class Ew>
+inline MixedGeom mixed_geometry (const Params & p, const CellGrid & a, const CellGrid & b)
+{
+  MixedGeom g;
+  if (p.rank != 3) return g;
+  const double r0 = b.h[0]/a.h[0];
+  for (int d = 1; d < 3; d++)
+    if (std::fabs(b.h[d]/a.h[d] - r0) > 1e-9*r0) return g;
+  if (same_spacing(a, b)) return g;
+  g.a_fine = r0 > 1.0;
+  const double rr = g.a_fine ? r0 : 1.0/r0;
+  g.R = std::lround(rr);
+  if (std::fabs(rr - g.R) > 1e-9*rr || g.R < 2 || (g.R & (g.R-1)) != 0) return g;
+  const CellGrid & fine = g.a_fine ? a : b;
+  const CellGrid & coarse = g.a_fine ? b : a;
+  if (fine.nx % g.R || fine.ny % g.R || fine.nz % g.R) return g;
+  (void) coarse;
+  for (int d = 0; d < 3; d++) {
+    g.u[d] = 0.5*fine.h[d];
+    const double t = (b.lo[d] - a.lo[d]) / g.u[d];
+    g.LO[d] = std::lround(t);
+    if (std::fabs(t - g.LO[d]) > 1e-6) return g;
+    g.wrap[d] = Ew::enabled && p.periodic[d];
+    if (g.wrap[d]) {
+      const double nn = p.dom_width[d] / g.u[d];
+      g.Ne[d] = std::lround(nn);
+      if (std::fabs(nn - g.Ne[d]) > 1e-6 || g.Ne[d] < 1) return g;
+    }
+  }
+  g.ok = true;
+  return g;
+}
+
+/// integer offset (in units of u) wrapped to the nearest periodic image, with
+/// the same tie-breaking as wrapped_disp
+inline long wrap_units (long D, long Ne)
+{
+  long r = D % Ne; if (r < 0) r += Ne;
+  return (2*r < Ne) ? r : r - Ne;
+}
+
+
 //----------------------------------------------------------------------
 // Whole block-pair sums (cells and particles)
 

@@ -48,6 +48,8 @@ public: // interface -- which methods should be public and which protected?
       ewald_order_(3),
       ewald_(nullptr),
       dt_max_(1.0e10),
+      leaf_chunk_(0),
+      leaf_theta_(0.5),
       ir_exit_(-1)
   { for (int i = 0; i < cello::num_children(); i++) i_msg_restrict_[i] = -1; }
 
@@ -641,6 +643,13 @@ protected: // attributes
 
   /// Maximum timestep
   double dt_max_;
+
+  /// Tree-based leaf-leaf interaction (see EnzoMethodMultipoleSubtree.hpp).
+  /// Each leaf Block is divided into chunks of leaf_chunk_^3 cells that form a
+  /// local octree, and a dual tree walk with opening angle leaf_theta_
+  /// replaces the brute-force sums. leaf_chunk_ = 0 (default) turns it off.
+  int leaf_chunk_;
+  double leaf_theta_;
 
 };
 

@@ -12,7 +12,7 @@ add_library(Enzo_gravity
   EnzoMethodBackgroundAcceleration.cpp EnzoMethodBackgroundAcceleration.hpp
   EnzoMethodGravity.cpp EnzoMethodGravity.hpp
   EnzoMethodMultipole.cpp EnzoMethodMultipole.hpp
-  EnzoMethodMultipoleDirect.hpp
+  EnzoMethodMultipoleDirect.hpp EnzoMethodMultipoleSubtree.hpp
   EnzoEwald.cpp EnzoEwald.hpp
   EnzoMethodPmDeposit.cpp EnzoMethodPmDeposit.hpp
   EnzoPhysicsGravity.cpp EnzoPhysicsGravity.hpp

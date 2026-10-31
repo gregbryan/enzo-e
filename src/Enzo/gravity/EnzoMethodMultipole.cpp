@@ -11,7 +11,10 @@
 #include "Enzo/gravity/gravity.hpp"
 #include "Enzo/gravity/EnzoEwald.hpp"
 #include "Enzo/gravity/EnzoMethodMultipoleDirect.hpp"
+#include "Enzo/gravity/EnzoMethodMultipoleSubtree.hpp"
 #include <map>
+#include <set>
+#include <string>
 
 //----------------------------------------------------------------------
 
@@ -28,8 +31,17 @@ EnzoMethodMultipole::EnzoMethodMultipole (ParameterGroup p)
     interp_zpoints_(p.value_integer("interp_zpoints", 32)),
     ewald_order_(p.value_integer("ewald_order", 3)),
     dt_max_(p.value_float("dt_max", 1.0e10)),
+    leaf_chunk_(p.value_integer("leaf_chunk", 0)),
+    leaf_theta_(p.value_float("leaf_theta", 0.5)),
     ir_exit_(-1)
 {
+  ASSERT1("EnzoMethodMultipole::EnzoMethodMultipole",
+          "leaf_chunk = %d must be between 0 (tree off) and 8",
+          leaf_chunk_, leaf_chunk_ >= 0 && leaf_chunk_ <= 8);
+  ASSERT1("EnzoMethodMultipole::EnzoMethodMultipole",
+          "leaf_theta = %g must not be negative",
+          leaf_theta_, leaf_theta_ >= 0.0);
+
   // CkPrintf("Have we started?");
 
   cello::define_field ("density");
@@ -123,6 +135,8 @@ void EnzoMethodMultipole::pup (PUP::er &p)
   p | interp_zpoints_;
   p | ewald_order_;
   p | dt_max_;
+  p | leaf_chunk_;
+  p | leaf_theta_;
 
   // bool ewald_is_nullptr = (ewald_ == nullptr);
   // p | ewald_is_nullptr;
@@ -1335,13 +1349,30 @@ fmm_direct::CellGrid make_cell_grid
   return c;
 }
 
+/// Warn, once for each reason on each PE, that the brute-force direct
+/// sums are used for a pair of Blocks because it does not have the structure
+/// the tree (leaf_chunk > 0) needs
+void warn_tree_fallback (int chunk, const char * why)
+{
+  static thread_local std::set<std::string> warned;
+  if (warned.insert(why ? why : "").second) {
+    WARNING2("EnzoMethodMultipole::direct_sums",
+             "leaf_chunk = %d: using the (slow) direct sums for pairs of Blocks "
+             "where %s",
+             chunk, why ? why : "the tree is not supported");
+  }
+}
+
 /// Add the acceleration on all cells and particles of Block a due to the
 /// cells and gravitating particles of Block b. If `self` the two Blocks are
 /// the same and a cell/particle's interaction with itself is omitted
 /// (`exclude` maps each target particle to its entry in the source list).
+/// If `tree` is given (and the pair of Blocks has the structure it needs) the
+/// sums are done with the local tree, otherwise by brute force.
 template <class Ew>
 void direct_sums
 (const fmm_direct::Params & params, const Ew & ew,
+ const fmm_direct::SubtreeOpts * tree,
  const fmm_direct::CellGrid & cells_a, const fmm_direct::CellGrid & cells_b,
  enzo_float * accel_x, enzo_float * accel_y, enzo_float * accel_z,
  const std::vector<double> & ptx, const std::vector<double> & pty,
@@ -1362,10 +1393,21 @@ void direct_sums
 
   std::vector<double> tax(npt,0.0), tay(npt,0.0), taz(npt,0.0);
 
-  accumulate_block_pair_direct(params, ew, cells_a, cells_b, self,
-                               accel_x, accel_y, accel_z,
-                               tgt, tax.data(), tay.data(), taz.data(),
-                               src, excl);
+  bool done = false;
+  if (tree != nullptr && tree->chunk > 0) {
+    const char * why = nullptr;
+    done = accumulate_block_pair_tree(params, ew, *tree, cells_a, cells_b, self,
+                                      accel_x, accel_y, accel_z,
+                                      tgt, tax.data(), tay.data(), taz.data(),
+                                      src, excl, &why);
+    if (!done) warn_tree_fallback(tree->chunk, why);
+  }
+  if (!done) {
+    accumulate_block_pair_direct(params, ew, cells_a, cells_b, self,
+                                 accel_x, accel_y, accel_z,
+                                 tgt, tax.data(), tay.data(), taz.data(),
+                                 src, excl);
+  }
 
   for (const TargetBatch & tb : batches) {
     for (int ip = 0; ip < tb.np; ip++) {
@@ -1584,6 +1626,9 @@ void EnzoMethodMultipole::evaluate_force_(Block * block) throw()
   // near-field: direct sums over the cells and particles of this Block
   // (every cell and particle with every other, excluding itself)
   const fmm_direct::Params params = direct_params(eps0_, grav_const);
+  fmm_direct::SubtreeOpts tree_opts;
+  tree_opts.chunk = leaf_chunk_; tree_opts.theta = leaf_theta_;
+  const fmm_direct::SubtreeOpts * tree = (leaf_chunk_ > 0) ? &tree_opts : nullptr;
 
   std::vector<double> dens_d (dens, dens + (size_t)mx*my*mz);
   const int m_[3] = {mx, my, mz}, g_[3] = {gx, gy, gz};
@@ -1600,11 +1645,11 @@ void EnzoMethodMultipole::evaluate_force_(Block * block) throw()
   gather_targets(particle, ptx, pty, ptz, batches, &src_offsets, &exclude);
 
   if (ewald_ != nullptr) {
-    direct_sums (params, EwaldD1(ewald_), cells, cells,
+    direct_sums (params, EwaldD1(ewald_), tree, cells, cells,
                  accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
                  psx, psy, psz, psm, true, &exclude);
   } else {
-    direct_sums (params, fmm_direct::NoEwald(), cells, cells,
+    direct_sums (params, fmm_direct::NoEwald(), tree, cells, cells,
                  accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
                  psx, psy, psz, psm, true, &exclude);
   }
@@ -2117,6 +2162,9 @@ void EnzoMethodMultipole::interact_direct_(Block * block, char * fldbuffer_b, ch
   // EnzoMethodMultipoleDirect.hpp
 
   const fmm_direct::Params params = direct_params(eps0_, grav_const);
+  fmm_direct::SubtreeOpts tree_opts;
+  tree_opts.chunk = leaf_chunk_; tree_opts.theta = leaf_theta_;
+  const fmm_direct::SubtreeOpts * tree = (leaf_chunk_ > 0) ? &tree_opts : nullptr;
 
   const int m_a[3] = {mx, my, mz}, m_b[3] = {mx2, my2, mz2};
   const int g_[3] = {gx, gy, gz};
@@ -2133,11 +2181,11 @@ void EnzoMethodMultipole::interact_direct_(Block * block, char * fldbuffer_b, ch
   gather_targets(particle, ptx, pty, ptz, batches, nullptr, nullptr);
 
   if (ewald_ != nullptr) {
-    direct_sums (params, EwaldD1(ewald_), cells_a, cells_b,
+    direct_sums (params, EwaldD1(ewald_), tree, cells_a, cells_b,
                  accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
                  psx, psy, psz, psm);
   } else {
-    direct_sums (params, fmm_direct::NoEwald(), cells_a, cells_b,
+    direct_sums (params, fmm_direct::NoEwald(), tree, cells_a, cells_b,
                  accel_x, accel_y, accel_z, ptx, pty, ptz, batches,
                  psx, psy, psz, psm);
   }
